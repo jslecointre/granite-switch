@@ -1,0 +1,19 @@
+# Sample questions for rag_101.py --queries-file (one per line, # = comment).
+# Government-services topics the corpus covers -> expect "answerable".
+How do I check the status of my federal tax refund?
+How long does it take to get a tax refund?
+How do I check the status of an amended tax return?
+How do I get an Identity Protection PIN?
+Who qualifies for the Earned Income Tax Credit?
+How do I claim the Child Tax Credit?
+What is the Employee Retention Credit?
+How do businesses get a California tax refund?
+What is the standard deduction this year?
+How do I file my taxes for free?
+# Off-topic for a government-services corpus -> expect "unanswerable".
+What's the best recipe for sourdough bread?
+Who won the 1998 FIFA World Cup?
+How do I change a flat bicycle tire?
+What is the boiling point of water on Mount Everest?
+Which programming language is best for beginners?
+How many moons does Jupiter have?

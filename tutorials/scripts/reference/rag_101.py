@@ -21,6 +21,13 @@ Usage:
     # Your own questions
     python tutorials/scripts/reference/rag_101.py -q "How do I renew a passport?" -q "..."
 
+    # Many questions at once, 8 in flight, to see vLLM's batching throughput
+    python tutorials/scripts/reference/rag_101.py \\
+        --queries-file tutorials/scripts/reference/rag_101_queries.txt --parallel 8
+
+    # Load once, then keep asking (empty line or Ctrl-D to quit)
+    python tutorials/scripts/reference/rag_101.py -i
+
 ``--base-url`` and ``--model`` default to ``$VLLM_BASE_URL`` / ``$VLLM_MODEL_NAME``.
 The corpus is cached in ``--chroma-path``, so only the first run embeds documents.
 
@@ -38,9 +45,12 @@ import os
 import re
 import shutil
 import signal
+import statistics
 import sys
 import time
 import urllib.request
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -132,6 +142,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Passed to vLLM as --dtype (e.g. float16 on a T4, which lacks bfloat16).",
     )
+    server.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=16,
+        help="With --launch-server: requests vLLM may batch together. "
+        "Keep >= --parallel, or parallel requests just queue.",
+    )
     server.add_argument("--server-timeout", type=int, default=900, help="Seconds.")
     server.add_argument("--server-log", default="vllm_server.log")
 
@@ -155,6 +172,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         dest="queries",
         help="Question to check (repeatable). Defaults to the notebook's two queries.",
+    )
+    run.add_argument(
+        "--queries-file",
+        type=Path,
+        help="Text file with one question per line (blank lines and # comments skipped).",
+    )
+    run.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help="Answerability requests in flight at once; vLLM batches them on the GPU.",
+    )
+    run.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="After the batch, keep everything loaded and prompt for more questions.",
     )
     run.add_argument(
         "--show-passages",
@@ -330,6 +364,7 @@ def start_server(args: argparse.Namespace) -> None:
         port=args.port,
         log_file=args.server_log,
         max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
         extra_args=extra_args,
     )
 
@@ -385,7 +420,8 @@ class Passage:
 class QueryResult:
     query: str
     verdict: str
-    seconds: float
+    retrieve_seconds: float  # ChromaDB lookup (local, CPU)
+    model_seconds: float  # answerability call to vLLM
     passages: list[Passage] = field(default_factory=list)
 
 
@@ -419,21 +455,40 @@ def check_answerability(query: str, passages: list[Passage], backend) -> str:
     return rag.check_answerability(query, documents, ChatContext(), backend)
 
 
-def run_query(query: str, collection, backend, top_k: int) -> QueryResult:
+def _timed(fn, *args):
     started = time.monotonic()
-    passages = retrieve(collection, query, top_k)
-    verdict = check_answerability(query, passages, backend)
-    return QueryResult(query, verdict, time.monotonic() - started, passages)
+    value = fn(*args)
+    return value, time.monotonic() - started
+
+
+def run_batch(
+    queries: list[str], collection, backend, top_k: int, parallel: int
+) -> Iterator[QueryResult]:
+    """Retrieve for every query, then check answerability `parallel` at a time.
+
+    Retrieval is a fast local lookup, so it runs first, one query after another.
+    The model calls are the slow part; sending several at once lets vLLM batch
+    them on the GPU. Results are yielded in input order as they complete.
+    """
+    retrieved = [_timed(retrieve, collection, q, top_k) for q in queries]
+
+    def answer(i: int) -> QueryResult:
+        passages, retrieve_s = retrieved[i]
+        verdict, model_s = _timed(check_answerability, queries[i], passages, backend)
+        return QueryResult(queries[i], verdict, retrieve_s, model_s, passages)
+
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
+        yield from pool.map(answer, range(len(queries)))
 
 
 def report(result: QueryResult, show_passages: int) -> None:
     mark = "✅" if result.verdict == "answerable" else "🚫"
     log.info(
-        "%s %-12s %s  (%.1fs)",
+        "%s %-12s %s  (model %.2fs)",
         mark,
         result.verdict.upper(),
         result.query,
-        result.seconds,
+        result.model_seconds,
     )
     for rank, p in enumerate(result.passages[:show_passages], start=1):
         log.info(
@@ -444,6 +499,58 @@ def report(result: QueryResult, show_passages: int) -> None:
 
 def _clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def summarize(results: list[QueryResult], wall_seconds: float, parallel: int) -> None:
+    answerable = sum(r.verdict == "answerable" for r in results)
+    model = sorted(r.model_seconds for r in results)
+    log.info("%d / %d queries answerable from the corpus", answerable, len(results))
+    log.info(
+        "%d queries in %.1fs wall time = %.2f queries/s  (parallel=%d)",
+        len(results),
+        wall_seconds,
+        len(results) / wall_seconds,
+        parallel,
+    )
+    log.info(
+        "Model latency per query: median %.2fs, max %.2fs  |  retrieval avg %.3fs",
+        statistics.median(model),
+        model[-1],
+        statistics.fmean(r.retrieve_seconds for r in results),
+    )
+
+
+def read_queries(args: argparse.Namespace) -> list[str]:
+    """-q flags plus --queries-file; the notebook's two queries if neither is given."""
+    queries = list(args.queries or [])
+    if args.queries_file:
+        for line in args.queries_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                queries.append(line)
+    if not queries and not args.interactive:
+        queries = DEFAULT_QUERIES
+    return queries
+
+
+def interactive_loop(
+    collection, backend, args: argparse.Namespace
+) -> list[QueryResult]:
+    """Prompt for questions until an empty line, 'quit', or Ctrl-D."""
+    log.info("Interactive mode: type a question, empty line or Ctrl-D to quit.")
+    results = []
+    while True:
+        try:
+            query = input("\nquestion> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if query.lower() in ("", "q", "quit", "exit"):
+            break
+        for result in run_batch([query], collection, backend, args.top_k, 1):
+            report(result, args.show_passages)
+            results.append(result)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +565,7 @@ def main(argv: list[str] | None = None) -> int:
 
     base_url = args.base_url or f"http://localhost:{args.port}/v1"
     adapter_source = args.adapter_source or args.model
-    queries = args.queries or DEFAULT_QUERIES
+    queries = read_queries(args)
 
     log.info("vLLM endpoint : %s", base_url)
     log.info("Model         : %s", args.model)
@@ -480,16 +587,23 @@ def main(argv: list[str] | None = None) -> int:
     section("3 · Connect mellea")
     backend = connect_backend(base_url, args.model, adapter_source)
 
-    section("4 · Retrieve + answerability")
-    results = []
-    for query in queries:
-        result = run_query(query, collection, backend, args.top_k)
-        report(result, args.show_passages)
-        results.append(result)
+    results: list[QueryResult] = []
+    if queries:
+        section(f"4 · Retrieve + answerability ({len(queries)} queries)")
+        started = time.monotonic()
+        for result in run_batch(
+            queries, collection, backend, args.top_k, args.parallel
+        ):
+            report(result, args.show_passages)
+            results.append(result)
+        wall_seconds = time.monotonic() - started
 
-    section("Summary")
-    answerable = sum(r.verdict == "answerable" for r in results)
-    log.info("%d / %d queries answerable from the corpus", answerable, len(results))
+        section("Summary")
+        summarize(results, wall_seconds, args.parallel)
+
+    if args.interactive:
+        section("Interactive")
+        results += interactive_loop(collection, backend, args)
 
     if args.output:
         args.output.write_text(json.dumps([asdict(r) for r in results], indent=2))
